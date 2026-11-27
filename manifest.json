@@ -2,24 +2,51 @@
   "manifest_version": 3,
   "name": "TikTok Auto-Fix & Following Helper",
   "short_name": "TT Auto-Fix",
-  "version": "1.0.0",
-  "description": "Automatically recovers from TikTok's \"Something went wrong\" error and auto-scrolls Following/Followers lists.",
+  "version": "1.1.0",
+  "description": "Recovers from TikTok's \"Something went wrong\" error, auto-scrolls Following/Followers lists, and fixes stale cached \"Follow\" buttons after a confirmed follow.",
   "minimum_chrome_version": "111",
-  "permissions": ["storage", "cookies", "activeTab", "scripting"],
-  "host_permissions": ["*://*.tiktok.com/*"],
+  "permissions": [
+    "storage",
+    "activeTab",
+    "declarativeNetRequest",
+    "cookies",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.tiktok.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "tiktok_no_cache",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "content_scripts": [
     {
-      "matches": ["*://*.tiktok.com/*"],
-      "js": ["page-hook.js"],
+      "matches": [
+        "*://*.tiktok.com/*"
+      ],
+      "js": [
+        "interceptor.js",
+        "page-hook.js"
+      ],
       "run_at": "document_start",
-      "world": "MAIN"
+      "world": "MAIN",
+      "all_frames": false
     },
     {
-      "matches": ["*://*.tiktok.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "*://*.tiktok.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

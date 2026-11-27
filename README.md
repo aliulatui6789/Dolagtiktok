@@ -4,6 +4,7 @@ A lightweight Chrome extension (Manifest V3, vanilla JS, no build step) for `*.t
 
 - **Auto-fixes the "Something went wrong" / "Đã xảy ra sự cố" error** that TikTok's web app sometimes shows, using a retry routine with a circuit breaker so it can't get stuck reloading forever.
 - **Auto-scrolls Following / Followers lists** until the end of the list, with Stop controls in both the popup and the page.
+- **Fixes stale "Follow" buttons after F5 (Follow Sync).** Sometimes TikTok saves a follow on the server (`status_code: 0`, `follow_status: 1`), but after a reload the profile still shows **Follow** from a cached copy. The extension remembers follows the server confirmed and re-labels that button **Following ✓ (Confirmed)** (or **Requested ✓** for private accounts), with a green outline.
 - Has a **dark popup** with a global on/off switch, a live count of errors fixed this session, and buttons to start and stop scrolling.
 
 ---
@@ -47,6 +48,10 @@ After changing files, click the **↻ reload** icon on the extension card in `ch
 | **Start Auto-Scroll List** | Open a profile's *Following* / *Followers* popup on TikTok first, then click this. |
 | **Stop Auto-Scroll** | Stops scrolling. You can also use the floating **Stop Scrolling** button on the page. |
 
+| **Follow Sync** count | How many follows the server confirmed in the last 24 h, kept in local storage. |
+| **Hard Refresh (Clear Cache)** | Reloads the active TikTok tab with `bypassCache: true`, like Ctrl+Shift+R. |
+| **Clear Sync History** | Deletes the stored list of confirmed follows. |
+
 The popup also shows the current tab's status: watching, fixing (attempt *n*/3), or given up on this URL.
 
 ---
@@ -77,6 +82,17 @@ error detected ──wait 2.5 s──► still there?
 - **Runs inside the page, not the popup.** The scroll loop runs in `content.js`, so closing the popup doesn't stop it. When you reopen the popup it asks `GET_SCROLL_STATUS` and shows the live state, about how many accounts are loaded, and why the last run ended.
 - **It also stops** when you press Stop (in the popup or on the page) or when you go to another page.
 
+### Follow Sync (stale cache fix)
+
+1. **`interceptor.js`** runs in the page's main JS context at `document_start` and wraps `window.fetch` and `XMLHttpRequest`. It only reads a copy of each response and never changes requests.
+   - `/api/commit/follow/user/` with `status_code === 0` (or `statusCode`): it reads `user_id` / `sec_user_id` from the URL or request body and `follow_status` from the response. If `follow_status` is missing, it uses the request's `type` (1 = follow, 0 = unfollow). It then dispatches `TT_FOLLOW_STATE_CONFIRMED` with `{ username, userId, secUid, followStatus, timestamp }`.
+   - `/api/user/detail/`, `/api/user/list/`, `…/item_list/` and the page's `__UNIVERSAL_DATA_FOR_REHYDRATION__` data are used only to link user IDs to `@usernames`. This way a follow made from another profile's Followers popup is saved under the right account, not under the profile in the address bar.
+2. **`content.js` (FollowSync)** saves each confirmation in `chrome.storage.local` under `ttFollowConfirmed`. Entries expire after **24 h**. `follow_status` 1 (following), 2 (friends) and 4 (requested) are saved; 0 (unfollowed) deletes the entry right away. On a profile page (`/@name`), a `MutationObserver` looks for the header's main follow button. If the account is in the saved list but TikTok still shows **Follow**, the button is re-labelled using CSS only (a `data-ttfs-confirmed` attribute and `::after`). TikTok's own DOM isn't edited, so its re-renders can't break the page. When TikTok shows the real state again, the label is removed.
+3. **`rules.json` (declarativeNetRequest)** sends `Cache-Control: no-cache` / `Pragma: no-cache` on `/api/user/detail/` requests. It also forces `Cache-Control: no-store` on those responses and on profile pages (`/@name`), so the browser stops serving them from cache.
+4. **`background.js`** handles `HARD_RELOAD_TAB`, which calls `chrome.tabs.reload(tabId, { bypassCache: true })` and only works on TikTok tabs.
+
+Clicking a re-labelled button still runs TikTok's own action. Because TikTok thinks you don't follow yet, it sends another follow, which changes nothing on the server. The page then shows **Following**, and you can unfollow normally.
+
 ### Messages between the parts
 
 | From → To | Message | Reply |
@@ -86,7 +102,11 @@ error detected ──wait 2.5 s──► still there?
 | content → popup (broadcast) | `TTAF_SCROLL_STATE` | — |
 | popup → background | `TTAF_GET_COUNTER`, `TTAF_RESET_COUNTER` | `{ ok, count }` |
 | popup → content | `START_SCROLL`, `STOP_SCROLL`, `GET_SCROLL_STATUS` (`TTAF_`-prefixed aliases also accepted) | `{ isScrolling, estimatedUsers, emptyAttempts, … }` |
-| popup → content | `TTAF_PING`, `TTAF_GET_STATUS` | status object |
+| popup → content | `TTAF_PING`, `TTAF_GET_STATUS` (includes `followSync`), `TTFS_GET_STATUS` | status object |
+| popup / content → background | `HARD_RELOAD_TAB` (`tabId` required from the popup) | `{ ok, tabId }` or `{ ok: false, error }` |
+| popup → background | `CLEAR_FOLLOW_SYNC` | `{ ok }` |
+| interceptor → content (window event) | `TT_FOLLOW_STATE_CONFIRMED`, `TT_USER_IDENTITY` | — |
+| content → interceptor (window event) | `TT_INTERCEPTOR_SYNC_REQUEST` (replays the user IDs and usernames seen so far) | — |
 
 ---
 
@@ -94,12 +114,13 @@ error detected ──wait 2.5 s──► still there?
 
 | Permission | Why |
 |---|---|
-| `storage` | Saves the on/off switch (`local`) and the session counter (`session`). |
+| `storage` | Saves the on/off switch (`local`), the session counter (`session`) and the confirmed-follow list (`local`, 24 h TTL). |
+| `declarativeNetRequest` | Static no-cache header rules in `rules.json` (TikTok profile pages and `/api/user/detail/` only). |
 | `cookies` | Deletes the `msToken` cookie on attempt 3. It's HttpOnly, so the page itself can't delete it. |
 | `activeTab`, `scripting` | Lets the popup inject `content.js` into a TikTok tab that was open before the extension was installed. |
 | host `*://*.tiktok.com/*` | Runs the content scripts and reads and removes cookies on TikTok only. |
 
-No analytics, no remote code, no network requests.
+No analytics, no remote code, and the extension sends no network requests of its own.
 
 ---
 
@@ -108,7 +129,9 @@ No analytics, no remote code, no network requests.
 ```
 manifest.json            MV3 manifest
 background.js            Service worker: msToken removal, counter, toolbar badge
+interceptor.js           Main-context fetch/XHR reader (follow results, user IDs and usernames)
 page-hook.js             Main-context history hook (catches SPA navigation)
+rules.json               declarativeNetRequest no-cache rules
 content.js               Error detection, auto-fix routine, URL watcher, auto-scroller
 popup.html / .css / .js  Popup UI
 icons/icon{16,48,128}.png
@@ -117,6 +140,6 @@ scripts/generate_icons.py  Rebuilds the icons with no dependencies: python3 scri
 
 ## Troubleshooting
 
-- Open DevTools on the TikTok tab and filter the console for `[TT Auto-Fix]` to see each step.
+- Open DevTools on the TikTok tab and filter the console for `[TT Auto-Fix]` or `[TT Follow-Sync]` to see each step.
 - **"Circuit breaker open"** means the error came back after all 3 attempts. Go to another page and back, or reload, to try again.
 - **"Reload the TikTok tab to activate the helper"** means the tab was open before the extension was installed or updated. Reload the tab.

@@ -7,12 +7,17 @@
  *   2. Keep the "errors fixed this session" counter and mirror it on the
  *      toolbar badge.
  *   3. Seed default settings on install.
+ *   4. Hard reload (bypassCache) of a TikTok tab for the Follow-Sync feature.
  *
  * Message protocol (all messages are objects with a `type` field):
  *   content -> bg  { type: 'TTAF_CLEAR_MSTOKEN' }  => { ok, removed, error? }
  *   content -> bg  { type: 'TTAF_ERROR_FIXED', url } => { ok, count }
  *   popup   -> bg  { type: 'TTAF_GET_COUNTER' }    => { ok, count }
  *   popup   -> bg  { type: 'TTAF_RESET_COUNTER' }  => { ok, count: 0 }
+ *   any     -> bg  { type: 'HARD_RELOAD_TAB', tabId? } => { ok, tabId }
+ *        Reloads the tab with bypassCache: true. `tabId` is required from the
+ *        popup (it has no sender.tab); content scripts may omit it.
+ *   popup   -> bg  { type: 'CLEAR_FOLLOW_SYNC' }   => { ok }
  */
 'use strict';
 
@@ -124,6 +129,23 @@ async function clearMsToken(tabId) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Follow-Sync                                                               */
+/* ------------------------------------------------------------------------- */
+
+const FOLLOW_SYNC_KEY = 'ttFollowConfirmed';
+const TIKTOK_URL_RE = /^https?:\/\/([a-z0-9-]+\.)*tiktok\.com\//i;
+
+/** Reloads a TikTok tab while bypassing the HTTP cache (like Ctrl+Shift+R). */
+async function hardReloadTab(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) throw new Error('No tab to reload.');
+  const tab = await chrome.tabs.get(tabId); // throws if the tab is gone
+  // tab.url is only visible for hosts we have access to; refuse anything else.
+  if (!tab.url || !TIKTOK_URL_RE.test(tab.url)) throw new Error('The tab is not a TikTok page.');
+  await chrome.tabs.reload(tabId, { bypassCache: true });
+  return tabId;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Message router                                                            */
 /* ------------------------------------------------------------------------- */
 
@@ -141,6 +163,14 @@ const handlers = {
   },
   async TTAF_RESET_COUNTER() {
     return { ok: true, count: await setCount(0) };
+  },
+  async HARD_RELOAD_TAB(msg, sender) {
+    const tabId = Number.isInteger(msg.tabId) ? msg.tabId : sender.tab && sender.tab.id;
+    return { ok: true, tabId: await hardReloadTab(tabId) };
+  },
+  async CLEAR_FOLLOW_SYNC() {
+    await chrome.storage.local.remove(FOLLOW_SYNC_KEY);
+    return { ok: true };
   },
 };
 

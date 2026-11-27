@@ -10,10 +10,16 @@
  *                            GET_SCROLL_STATUS to show the live state again.
  *                            Injects content.js via chrome.scripting if the tab
  *                            was opened before the extension was installed.
+ *  - Follow Sync          -> count of confirmed follows in chrome.storage.local
+ *                            (`ttFollowConfirmed`, 24 h TTL), HARD_RELOAD_TAB
+ *                            (background, bypassCache) and CLEAR_FOLLOW_SYNC.
  */
 'use strict';
 
 const COUNTER_KEY = 'fixedCount';
+const FOLLOW_SYNC_KEY = 'ttFollowConfirmed';
+const FOLLOW_SYNC_TTL_MS = 24 * 60 * 60 * 1000;
+const CONFIRMED_STATES = new Set([1, 2, 4]);
 const TIKTOK_URL_RE = /^https?:\/\/([a-z0-9-]+\.)*tiktok\.com\//i;
 
 const $ = (id) => document.getElementById(id);
@@ -26,6 +32,10 @@ const ui = {
   stop: $('stopScroll'),
   scrollStatus: $('scrollStatus'),
   version: $('version'),
+  syncCount: $('syncCount'),
+  hardRefresh: $('hardRefresh'),
+  clearSync: $('clearSync'),
+  syncStatus: $('syncStatus'),
 };
 
 let activeTab = null;
@@ -109,10 +119,54 @@ function renderPageStatus(status) {
   }
 }
 
+function setSyncStatus(text, variant = '') {
+  ui.syncStatus.textContent = text;
+  ui.syncStatus.className = `scroll-status ${variant}`.trim();
+}
+
+/** Counts non-expired confirmed follows (1 following, 2 friends, 4 requested). */
+function renderSyncCount(entries) {
+  const now = Date.now();
+  const count = Object.values(entries || {}).filter((e) => e
+    && CONFIRMED_STATES.has(Number(e.followStatus))
+    && typeof e.timestamp === 'number'
+    && now - e.timestamp < FOLLOW_SYNC_TTL_MS).length;
+  ui.syncCount.textContent = String(count);
+}
+
+async function loadSyncCount() {
+  try {
+    const data = await chrome.storage.local.get(FOLLOW_SYNC_KEY);
+    renderSyncCount(data[FOLLOW_SYNC_KEY]);
+  } catch (err) {
+    console.warn('[TT Follow-Sync] Could not read storage:', err);
+    renderSyncCount({});
+  }
+}
+
+let syncMessageUntil = 0; // keep a button's result visible for a moment
+
+function renderFollowSync(sync) {
+  if (Date.now() < syncMessageUntil) return;
+  if (!activeTab) {
+    setSyncStatus('Open a tiktok.com tab to use Hard Refresh.', 'warn');
+  } else if (!sync || !sync.username) {
+    setSyncStatus('Open a profile (tiktok.com/@name) to check its follow state.');
+  } else if (sync.patched) {
+    setSyncStatus(`@${sync.username}: server confirmed ${sync.followStatus === 4 ? 'request' : 'follow'}, ` +
+      'page shows a cached "Follow" — button re-labelled. Hard Refresh to reload without cache.', 'ok');
+  } else if (sync.confirmed) {
+    setSyncStatus(`@${sync.username}: follow confirmed and the page is up to date.`, 'ok');
+  } else {
+    setSyncStatus(`@${sync.username}: no confirmed follow recorded in the last 24 h.`);
+  }
+}
+
 async function refreshTabStatus() {
   const status = await sendToTab({ type: 'TTAF_GET_STATUS' });
   renderPageStatus(status);
   renderScroll(status ? status.scroll : { scrolling: false });
+  renderFollowSync(status && status.followSync);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -161,10 +215,37 @@ ui.stop.addEventListener('click', async () => {
   }
 });
 
+ui.hardRefresh.addEventListener('click', async () => {
+  if (!activeTab) return;
+  ui.hardRefresh.disabled = true;
+  try {
+    const res = await sendToBackground({ type: 'HARD_RELOAD_TAB', tabId: activeTab.id });
+    syncMessageUntil = Date.now() + 3000;
+    if (res && res.ok) setSyncStatus('Reloading the tab without cache…', 'ok');
+    else setSyncStatus(`Hard refresh failed: ${(res && res.error) || 'no response from the extension'}.`, 'warn');
+  } finally {
+    setTimeout(() => { ui.hardRefresh.disabled = !activeTab; }, 1500);
+  }
+});
+
+ui.clearSync.addEventListener('click', async () => {
+  const res = await sendToBackground({ type: 'CLEAR_FOLLOW_SYNC' });
+  syncMessageUntil = Date.now() + 3000;
+  if (res && res.ok) {
+    renderSyncCount({});
+    setSyncStatus('Sync history cleared.');
+  } else {
+    setSyncStatus(`Could not clear history: ${(res && res.error) || 'no response from the extension'}.`, 'warn');
+  }
+});
+
 /* Live updates: counter (storage) and scroll ticks (runtime broadcast). */
 chrome.storage.onChanged.addListener((changes, area) => {
   if (changes[COUNTER_KEY] && (area === 'session' || area === 'local')) {
     renderCount(changes[COUNTER_KEY].newValue);
+  }
+  if (area === 'local' && changes[FOLLOW_SYNC_KEY]) {
+    renderSyncCount(changes[FOLLOW_SYNC_KEY].newValue);
   }
   if (area === 'local' && changes.autoFixEnabled) {
     ui.toggle.checked = changes.autoFixEnabled.newValue !== false;
@@ -188,6 +269,8 @@ async function init() {
   const settings = await chrome.storage.local.get({ autoFixEnabled: true });
   ui.toggle.checked = settings.autoFixEnabled !== false;
 
+  await loadSyncCount();
+
   const counter = await sendToBackground({ type: 'TTAF_GET_COUNTER' });
   renderCount(counter && counter.ok ? counter.count : 0);
 
@@ -204,7 +287,9 @@ async function init() {
     setStatus(ui.pageStatus, 'Open a tiktok.com tab to use the helper.', 'warn');
     ui.start.disabled = true;
     ui.stop.disabled = true;
+    ui.hardRefresh.disabled = true;
+    renderFollowSync(null);
   }
 }
 
-init();
+init().catch((err) => console.warn('[TT Auto-Fix] Popup init failed:', err));

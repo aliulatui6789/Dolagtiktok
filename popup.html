@@ -48,6 +48,26 @@
     <p class="scroll-status" id="scrollStatus">Idle</p>
   </section>
 
+  <section class="card">
+    <div class="row">
+      <span>
+        <span class="row-title">Follow Sync</span>
+        <span class="row-hint">Fixes a stale "Follow" button after a follow TikTok already saved.</span>
+      </span>
+    </div>
+    <div class="row stats">
+      <div class="stat">
+        <span class="stat-value ok" id="syncCount">0</span>
+        <span class="stat-label">confirmed follows cached (24 h)</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn primary" id="hardRefresh">Hard Refresh (Clear Cache)</button>
+      <button type="button" class="btn secondary" id="clearSync">Clear Sync History</button>
+    </div>
+    <p class="scroll-status" id="syncStatus">—</p>
+  </section>
+
   <footer class="footer" id="footer">v<span id="version"></span></footer>
 
   <script src="popup.js"></script>
