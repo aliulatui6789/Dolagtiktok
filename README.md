@@ -71,9 +71,11 @@ error detected ──wait 2.5 s──► still there?
 
 ### Auto-scroll
 
-- **What it scrolls:** the largest scrollable element inside `[data-e2e="follow-info-popup"]`. If that isn't found, it tries any open `[role=dialog]`, then the largest scrollable element on the page, then the page itself.
-- **Every 1.6 s** it sends a `WheelEvent` (which triggers TikTok's lazy-loading) and smooth-scrolls `scrollTop` to the bottom.
-- **It stops** after **8 checks in a row** with no increase in `scrollHeight`, if you stop it, if you navigate, or if the list disappears.
+- **Finds its targets again on every tick (every 1.8 s).** It doesn't use fixed class names. Each tick it scrolls every visible `div` that has `overflow-y: auto|scroll`, `scrollHeight > clientHeight + 20` and `clientHeight > 150`. It also scrolls `[data-e2e="follow-info-popup"] > div:last-child`, `div[class*="DivUserListContainer"]` and `document.scrollingElement`. If TikTok swaps out the list element, the next tick picks up the new one.
+- **For each target:** sets `scrollTop = scrollHeight`, then sends a `scroll` event and a `WheelEvent` (`deltaY: 800`). After that it calls `window.scrollTo(0, document.body.scrollHeight)`.
+- **Detecting the end of the list:** a tick counts as empty only if none of these grew: the tallest container's `scrollHeight`, the number of `a[href*="/@"]` links, or the number of different profiles seen so far. The last one matters because TikTok's list removes old rows from the page as you scroll. After **12 empty ticks in a row (~21 s)** it stops, which leaves time for slow proxies.
+- **Runs inside the page, not the popup.** The scroll loop runs in `content.js`, so closing the popup doesn't stop it. When you reopen the popup it asks `GET_SCROLL_STATUS` and shows the live state, about how many accounts are loaded, and why the last run ended.
+- **It also stops** when you press Stop (in the popup or on the page) or when you go to another page.
 
 ### Messages between the parts
 
@@ -83,7 +85,8 @@ error detected ──wait 2.5 s──► still there?
 | content → background | `TTAF_ERROR_FIXED` | `{ ok, count }` |
 | content → popup (broadcast) | `TTAF_SCROLL_STATE` | — |
 | popup → background | `TTAF_GET_COUNTER`, `TTAF_RESET_COUNTER` | `{ ok, count }` |
-| popup → content | `TTAF_PING`, `TTAF_START_SCROLL`, `TTAF_STOP_SCROLL`, `TTAF_GET_STATUS` | status object |
+| popup → content | `START_SCROLL`, `STOP_SCROLL`, `GET_SCROLL_STATUS` (`TTAF_`-prefixed aliases also accepted) | `{ isScrolling, estimatedUsers, emptyAttempts, … }` |
+| popup → content | `TTAF_PING`, `TTAF_GET_STATUS` | status object |
 
 ---
 

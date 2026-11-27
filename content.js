@@ -41,9 +41,9 @@
     /** Fallback polling interval for URL changes (if the MAIN-world hook is unavailable). */
     urlPollMs: 1000,
     /** Auto-scroll tick interval. */
-    scrollIntervalMs: 1600,
-    /** Consecutive ticks without height growth before auto-scroll stops. */
-    scrollMaxIdleChecks: 8,
+    scrollIntervalMs: 1800,
+    /** Consecutive ticks with no growth (height AND links) before auto-scroll stops (~21 s). */
+    scrollMaxIdleChecks: 12,
   });
 
   const STORAGE_PREFIX = 'ttaf:retry:';
@@ -446,76 +446,165 @@
   /* 6. AutoScroller — Feature B                                             */
   /* ======================================================================= */
 
+  /**
+   * Multi-target scroll engine.
+   *
+   * TikTok's class names (e.g. `DivUserListContainer-…`) change often, and the
+   * list can be re-rendered (new element) while we scroll. So instead of
+   * locking onto one element at start, EVERY tick re-scans the DOM for all
+   * visible scrollable containers and scrolls each of them to the bottom,
+   * firing `scroll` + `wheel` events so React's virtualised list / infinite
+   * loader reacts exactly as it does to the manual DevTools script.
+   *
+   * The loop lives entirely in this content script: closing or re-opening the
+   * popup does not affect it. The popup only reads state via GET_SCROLL_STATUS.
+   *
+   * Completion: a tick is "empty" only if NONE of these grew since the last
+   * tick: max container scrollHeight, number of `a[href*="/@"]` links, number
+   * of unique profile links seen so far. 12 empty ticks in a row (~21 s at
+   * 1.8 s/tick) => end of list. Slow proxies get plenty of time.
+   */
+
+  /** Module-scope scroll state (survives popup open/close). */
+  let isScrolling = false;
+  let estimatedUsers = 0;
+  /** Why the last run ended (shown when the popup is re-opened after it finished). */
+  let lastStopReason = null;
+
   const AutoScroller = {
     timer: null,
-    target: null,
-    lastHeight: 0,
-    idleChecks: 0,
     ticks: 0,
+    emptyAttempts: 0,
+    lastMaxHeight: 0,
+    lastLinkCount: 0,
+    /** Unique profile URLs seen during this run (handles virtualised lists that recycle rows). */
+    seenProfiles: new Set(),
+    lastContainerCount: 0,
     overlay: null,
 
-    isScrollable(el) {
-      if (!el || el.scrollHeight <= el.clientHeight + 8) return false;
-      const { overflowY } = window.getComputedStyle(el);
-      return overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay';
+    /** Explicit candidates, checked in addition to the generic scan. */
+    EXTRA_SELECTORS: [
+      '[data-e2e="follow-info-popup"] > div:last-child',
+      'div[class*="DivUserListContainer"]',
+    ],
+
+    /** True if the element is on screen (rendered with a box). */
+    isRendered(el) {
+      return el.isConnected && el.getClientRects().length > 0 && el.id !== 'ttaf-scroll-overlay';
     },
 
-    /** Picks the largest scrollable element inside `root` (including root). */
-    largestScrollableIn(root) {
-      let best = null;
-      let bestArea = 0;
-      const consider = (el) => {
-        if (!this.isScrollable(el) || !ErrorDetector.isVisible(el)) return;
-        const rect = el.getBoundingClientRect();
-        const area = rect.width * rect.height;
-        if (area > bestArea) {
-          best = el;
-          bestArea = area;
-        }
-      };
-      consider(root);
-      root.querySelectorAll('*').forEach(consider);
-      return best;
+    isScrollableStyle(el) {
+      const { overflowY } = window.getComputedStyle(el);
+      return overflowY === 'auto' || overflowY === 'scroll';
     },
 
     /**
-     * Target priority:
-     *   1. Scrollable container inside the Following/Followers modal.
-     *   2. Any other open dialog's scrollable list.
-     *   3. Largest scrollable element on the page.
-     *   4. The document itself.
+     * Returns every scroll target for this tick:
+     *   a) any visible div that is scrollable (overflow auto/scroll), has
+     *      content taller than itself (+20 px) and is at least 150 px tall;
+     *   b) the follow-popup's last child and any `DivUserListContainer`
+     *      (if they can actually scroll);
+     *   c) document.scrollingElement.
      */
-    findTarget() {
-      const modal = document.querySelector('[data-e2e="follow-info-popup"]');
-      if (modal) {
-        const inner = this.largestScrollableIn(modal);
-        if (inner) return inner;
+    findContainers() {
+      const found = new Set();
+
+      for (const el of document.querySelectorAll('div')) {
+        if (el.scrollHeight <= el.clientHeight + 20 || el.clientHeight <= 150) continue; // cheap checks first
+        if (this.isScrollableStyle(el) && this.isRendered(el)) found.add(el);
       }
-      for (const dialog of document.querySelectorAll('[role="dialog"]')) {
-        if (!ErrorDetector.isVisible(dialog)) continue;
-        const inner = this.largestScrollableIn(dialog);
-        if (inner) return inner;
+
+      for (const selector of this.EXTRA_SELECTORS) {
+        for (const el of document.querySelectorAll(selector)) {
+          if (el.scrollHeight > el.clientHeight && this.isRendered(el)) found.add(el);
+        }
       }
-      return this.largestScrollableIn(document.body) || document.scrollingElement || document.documentElement;
+
+      const root = document.scrollingElement || document.documentElement;
+      if (root) found.add(root);
+      return [...found];
+    },
+
+    /** Root used to count "loaded accounts": the follow popup if open, else the page. */
+    listRoot() {
+      return document.querySelector('[data-e2e="follow-info-popup"]') || document;
+    },
+
+    /** Collects profile links; returns the total link count in the document. */
+    collectProfiles() {
+      const allLinks = document.querySelectorAll('a[href*="/@"]');
+      for (const a of this.listRoot().querySelectorAll('a[href*="/@"]')) {
+        const match = /\/@([^/?#]+)/.exec(a.getAttribute('href') || '');
+        if (match) this.seenProfiles.add(match[1].toLowerCase());
+      }
+      estimatedUsers = this.seenProfiles.size;
+      return allLinks.length;
+    },
+
+    scrollContainer(el) {
+      el.scrollTop = el.scrollHeight;
+      // Dispatch on body for the root scroller; window listeners still see it (bubbles).
+      const target = el === document.scrollingElement || el === document.documentElement ? document : el;
+      target.dispatchEvent(new Event('scroll', { bubbles: true }));
+      (target === document ? document.body : el).dispatchEvent(
+        new WheelEvent('wheel', { deltaY: 800, deltaMode: 0, bubbles: true, cancelable: true }),
+      );
+    },
+
+    tick() {
+      if (!isScrolling) return;
+
+      const containers = this.findContainers();
+      this.lastContainerCount = containers.length;
+
+      // 1) Measure progress: the previous tick's scroll had 1.8 s to load more rows.
+      const maxHeight = containers.reduce((max, el) => Math.max(max, el.scrollHeight), 0);
+      const seenBefore = this.seenProfiles.size;
+      const linkCount = this.collectProfiles();
+
+      if (this.ticks > 0) {
+        const grew = maxHeight > this.lastMaxHeight
+          || linkCount > this.lastLinkCount
+          || this.seenProfiles.size > seenBefore;
+        this.emptyAttempts = grew ? 0 : this.emptyAttempts + 1;
+      }
+      // Track high-water marks so a list that briefly shrinks (re-render) isn't "growth" later.
+      this.lastMaxHeight = Math.max(this.lastMaxHeight, maxHeight);
+      this.lastLinkCount = Math.max(this.lastLinkCount, linkCount);
+      this.ticks += 1;
+
+      if (this.emptyAttempts >= CONFIG.scrollMaxIdleChecks) {
+        this.stop('finished (end of list)');
+        return;
+      }
+
+      // 2) Scroll everything + fire events.
+      for (const el of containers) {
+        try {
+          this.scrollContainer(el);
+        } catch (_) {
+          /* element vanished mid-tick — next tick rescans */
+        }
+      }
+      window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+
+      this.updateOverlay();
+      this.broadcast('tick');
     },
 
     status() {
       return {
-        scrolling: Boolean(this.timer),
+        ok: true,
+        scrolling: isScrolling,
+        isScrolling,
+        estimatedUsers,
         ticks: this.ticks,
-        idleChecks: this.idleChecks,
+        idleChecks: this.emptyAttempts,
+        emptyAttempts: this.emptyAttempts,
         maxIdleChecks: CONFIG.scrollMaxIdleChecks,
-        target: this.describeTarget(),
+        containers: this.lastContainerCount,
+        reason: isScrolling ? null : lastStopReason,
       };
-    },
-
-    describeTarget() {
-      const el = this.target;
-      if (!el) return null;
-      if (el === document.scrollingElement || el === document.documentElement) return 'page';
-      if (el.closest('[data-e2e="follow-info-popup"]')) return 'follow list popup';
-      if (el.closest('[role="dialog"]')) return 'dialog';
-      return el.getAttribute('data-e2e') || el.tagName.toLowerCase();
     },
 
     broadcast(reason) {
@@ -523,77 +612,36 @@
     },
 
     start() {
-      if (this.timer) return { ok: true, alreadyRunning: true, ...this.status() };
+      if (isScrolling) return { ...this.status(), alreadyRunning: true };
 
-      this.target = this.findTarget();
-      this.lastHeight = this.target.scrollHeight;
-      this.idleChecks = 0;
+      isScrolling = true;
+      lastStopReason = null;
       this.ticks = 0;
-      this.showOverlay();
-      log('Auto-scroll started on', this.describeTarget(), this.target);
+      this.emptyAttempts = 0;
+      this.lastMaxHeight = 0;
+      this.lastLinkCount = 0;
+      this.seenProfiles = new Set();
+      estimatedUsers = 0;
 
-      this.tick(); // first step immediately, then on interval
+      this.showOverlay();
+      log('Auto-scroll started.');
+      this.tick(); // first step immediately
       this.timer = setInterval(() => this.tick(), CONFIG.scrollIntervalMs);
-      this.broadcast('started');
-      return { ok: true, ...this.status() };
+      return this.status();
     },
 
     stop(reason = 'stopped') {
-      if (this.timer) {
-        clearInterval(this.timer);
-        this.timer = null;
-        log(`Auto-scroll ${reason} after ${this.ticks} tick(s).`);
-      }
+      const wasRunning = isScrolling;
+      isScrolling = false;
+      clearInterval(this.timer);
+      this.timer = null;
       this.hideOverlay();
-      this.broadcast(reason);
-      return { ok: true, ...this.status() };
-    },
-
-    tick() {
-      const el = this.target;
-      if (!el || !el.isConnected) {
-        // Modal was closed (or the SPA re-rendered it) — try to re-acquire once.
-        this.target = this.findTarget();
-        if (!this.target || !this.target.isConnected) return this.stop('target lost');
+      if (wasRunning) {
+        lastStopReason = reason;
+        log(`Auto-scroll ${reason} after ${this.ticks} tick(s), ~${estimatedUsers} account(s) loaded.`);
+        this.broadcast(reason);
       }
-
-      const target = this.target;
-      const height = target.scrollHeight;
-
-      if (this.ticks > 0) {
-        if (height > this.lastHeight) {
-          this.idleChecks = 0;
-        } else {
-          this.idleChecks += 1;
-          if (this.idleChecks >= CONFIG.scrollMaxIdleChecks) return this.stop('finished (end of list)');
-        }
-      }
-      this.lastHeight = height;
-      this.ticks += 1;
-
-      // A real wheel event triggers TikTok's infinite-loader listeners…
-      const rect = target.getBoundingClientRect();
-      const isPage = target === document.scrollingElement || target === document.documentElement;
-      const wheel = new WheelEvent('wheel', {
-        deltaY: Math.max(400, target.clientHeight || window.innerHeight),
-        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-        bubbles: true,
-        cancelable: true,
-        clientX: isPage ? window.innerWidth / 2 : rect.left + rect.width / 2,
-        clientY: isPage ? window.innerHeight / 2 : rect.top + rect.height / 2,
-      });
-      (isPage ? document.body : target).dispatchEvent(wheel);
-
-      // …and scrollTop guarantees the IntersectionObserver sentinel is reached.
-      if (typeof target.scrollTo === 'function') {
-        target.scrollTo({ top: target.scrollHeight, behavior: 'smooth' });
-      } else {
-        target.scrollTop = target.scrollHeight;
-      }
-
-      this.updateOverlay();
-      this.broadcast('tick');
-      return undefined;
+      return { ...this.status(), reason };
     },
 
     /* --- Floating on-page "Stop Scrolling" control ---------------------- */
@@ -637,7 +685,7 @@
     updateOverlay() {
       const label = this.overlay && this.overlay.shadowRoot.querySelector('.label');
       if (label) {
-        label.textContent = `Auto-scrolling… tick ${this.ticks} · idle ${this.idleChecks}/${CONFIG.scrollMaxIdleChecks}`;
+        label.textContent = `Auto-scrolling… ~${estimatedUsers} accounts · idle ${this.emptyAttempts}/${CONFIG.scrollMaxIdleChecks}`;
       }
     },
 
@@ -660,11 +708,16 @@
       case 'TTAF_PING':
         sendResponse({ ok: true });
         return false;
+      case 'START_SCROLL':
       case 'TTAF_START_SCROLL':
         sendResponse(AutoScroller.start());
         return false;
+      case 'STOP_SCROLL':
       case 'TTAF_STOP_SCROLL':
         sendResponse(AutoScroller.stop('stopped by user'));
+        return false;
+      case 'GET_SCROLL_STATUS':
+        sendResponse(AutoScroller.status());
         return false;
       case 'TTAF_GET_STATUS': {
         const retry = RetryStore.get();
@@ -696,7 +749,7 @@
     if (NavigationWatch.isFreshDocumentLoad()) RetryStore.clearAll();
 
     NavigationWatch.init(() => {
-      if (AutoScroller.timer) AutoScroller.stop('stopped (navigation)');
+      if (isScrolling) AutoScroller.stop('stopped (navigation)');
       AutoFixer.resetForNavigation();
     });
 

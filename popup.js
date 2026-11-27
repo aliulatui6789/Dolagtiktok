@@ -4,8 +4,11 @@
  *  - Auto-Fix toggle      -> chrome.storage.local `autoFixEnabled` (content.js watches it)
  *  - Errors-fixed counter -> background (TTAF_GET_COUNTER / TTAF_RESET_COUNTER),
  *                            live-updated via chrome.storage.onChanged
- *  - Auto-scroll buttons  -> content.js (TTAF_START_SCROLL / TTAF_STOP_SCROLL);
- *                            injects content.js via chrome.scripting if the tab
+ *  - Auto-scroll buttons  -> content.js (START_SCROLL / STOP_SCROLL). The scroll
+ *                            loop runs entirely in content.js, so it keeps going
+ *                            after this popup closes. On open, the popup asks
+ *                            GET_SCROLL_STATUS to show the live state again.
+ *                            Injects content.js via chrome.scripting if the tab
  *                            was opened before the extension was installed.
  */
 'use strict';
@@ -80,12 +83,12 @@ function renderScroll(scroll) {
   ui.stop.disabled = !running;
 
   if (!scroll) return;
+  const users = Number(scroll.estimatedUsers) || 0;
   if (running) {
-    const where = scroll.target ? ` on ${scroll.target}` : '';
     setStatus(ui.scrollStatus,
-      `Scrolling${where} · tick ${scroll.ticks} · idle ${scroll.idleChecks}/${scroll.maxIdleChecks}`, 'active');
+      `Scrolling · ~${users} accounts loaded · idle ${scroll.emptyAttempts}/${scroll.maxIdleChecks}`, 'active');
   } else if (scroll.reason && scroll.reason !== 'tick') {
-    setStatus(ui.scrollStatus, `Auto-scroll ${scroll.reason}${scroll.ticks ? ` (${scroll.ticks} ticks)` : ''}.`);
+    setStatus(ui.scrollStatus, `Auto-scroll ${scroll.reason} · ~${users} accounts loaded.`);
   }
 }
 
@@ -126,20 +129,36 @@ ui.reset.addEventListener('click', async () => {
   if (res && res.ok) renderCount(res.count);
 });
 
+/**
+ * Start is fire-and-forget from the popup's point of view: START_SCROLL is sent
+ * first (one round-trip), so the loop is already running in the page even if
+ * the user clicks back onto TikTok and the popup closes right away. Every
+ * promise is caught, so a closed popup never produces an uncaught error.
+ */
 ui.start.addEventListener('click', async () => {
   ui.start.disabled = true;
   setStatus(ui.scrollStatus, 'Starting…');
-  if (!(await ensureContentScript())) {
-    setStatus(ui.scrollStatus, 'Could not reach the page. Reload the TikTok tab and try again.', 'warn');
-    ui.start.disabled = false;
-    return;
+  try {
+    let res = await sendToTab({ type: 'START_SCROLL' });
+    if (!res && (await ensureContentScript())) res = await sendToTab({ type: 'START_SCROLL' });
+    if (!res) {
+      setStatus(ui.scrollStatus, 'Could not reach the page. Reload the TikTok tab and try again.', 'warn');
+      ui.start.disabled = false;
+      return;
+    }
+    renderScroll(res);
+  } catch (_) {
+    /* popup closed mid-request — the scroll loop in content.js is unaffected */
   }
-  renderScroll(await sendToTab({ type: 'TTAF_START_SCROLL' }));
 });
 
 ui.stop.addEventListener('click', async () => {
-  const res = await sendToTab({ type: 'TTAF_STOP_SCROLL' });
-  renderScroll(res ? { ...res, reason: 'stopped' } : { scrolling: false });
+  try {
+    const res = await sendToTab({ type: 'STOP_SCROLL' });
+    renderScroll(res || { scrolling: false });
+  } catch (_) {
+    /* popup closed mid-request */
+  }
 });
 
 /* Live updates: counter (storage) and scroll ticks (runtime broadcast). */
@@ -176,6 +195,9 @@ async function init() {
   // tab.url is only visible for hosts we have permission for, i.e. TikTok.
   if (tab && tab.url && TIKTOK_URL_RE.test(tab.url)) {
     activeTab = tab;
+    // Restore the live scroll state first (scrolling may have been started earlier).
+    const scroll = await sendToTab({ type: 'GET_SCROLL_STATUS' });
+    if (scroll) renderScroll(scroll);
     await refreshTabStatus();
     statusTimer = setInterval(refreshTabStatus, 1500);
   } else {
