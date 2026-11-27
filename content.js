@@ -8,6 +8,8 @@
  *   4. AutoFixer       — MutationObserver + retry state machine + circuit breaker.
  *   5. NavigationWatch — SPA URL change detection (pushState/replaceState/popstate).
  *   6. AutoScroller    — Following/Followers list auto-scroll (Feature B).
+ *   6b. FollowSync     — re-labels a stale cached "Follow" button after F5 when
+ *                        interceptor.js saw the server confirm the follow.
  *   7. Message bridge  — popup <-> content <-> background messaging.
  *
  * The whole file is wrapped in a guard so that a second injection via
@@ -698,6 +700,367 @@
   };
 
   /* ======================================================================= */
+  /* 6b. FollowSync — stale "Follow" button fix                              */
+  /* ======================================================================= */
+
+  /**
+   * interceptor.js (MAIN world) reports every successful
+   * /api/commit/follow/user/ response as `TT_FOLLOW_STATE_CONFIRMED`. We keep
+   * the confirmed follows in chrome.storage.local (24 h TTL) and, on profile
+   * pages, re-label a stale cached "Follow" button as
+   * "Following ✓ (Confirmed)" / "Requested ✓".
+   *
+   * The button is re-labelled purely with CSS (attribute + ::after), never by
+   * editing React-owned text nodes, so TikTok's own re-renders cannot break.
+   *
+   * Storage shape (key FOLLOW_SYNC_KEY):
+   *   { [userId || '@' + username]: { username, userId, secUid, followStatus, timestamp } }
+   */
+  const FOLLOW_SYNC_KEY = 'ttFollowConfirmed';
+  const FOLLOW_SYNC_TTL_MS = 24 * 60 * 60 * 1000;
+  /** 1 = following, 2 = mutual/friends, 4 = requested (private account). */
+  const FOLLOWING_STATES = new Set([1, 2]);
+  const REQUESTED_STATE = 4;
+  /** Labels of a NOT-following primary button (EN + VI). */
+  const FOLLOW_LABEL_RE = /^(follow|follow back|theo dõi|follow lại|theo dõi lại)$/i;
+  const PATCH_ATTR = 'data-ttfs-confirmed';
+  const LABEL_ATTR = 'data-ttfs-label';
+
+  const FollowSync = {
+    entries: {},
+    /** lower-case username -> userId, learnt from TT_USER_IDENTITY. */
+    usernameToId: new Map(),
+    observer: null,
+    scanTimer: null,
+    writeQueue: Promise.resolve(),
+    patchedButton: null,
+    lastState: null,
+
+    async init() {
+      this.injectStyle();
+      await this.load();
+
+      window.addEventListener('TT_FOLLOW_STATE_CONFIRMED', (e) => this.onConfirmed(this.readDetail(e)));
+      window.addEventListener('TT_USER_IDENTITY', (e) => this.onIdentity(this.readDetail(e)));
+
+      try {
+        chrome.storage.onChanged.addListener((changes, area) => {
+          if (area !== 'local' || !changes[FOLLOW_SYNC_KEY]) return;
+          this.entries = this.prune(changes[FOLLOW_SYNC_KEY].newValue || {});
+          this.scheduleScan();
+        });
+      } catch (err) {
+        warn('Follow-Sync: storage listener unavailable', err);
+      }
+
+      // Ask the interceptor to replay identities learnt before we loaded.
+      window.dispatchEvent(new CustomEvent('TT_INTERCEPTOR_SYNC_REQUEST'));
+
+      this.observer = new MutationObserver(() => this.scheduleScan());
+      this.observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+      this.scheduleScan();
+    },
+
+    /** CustomEvent.detail crosses worlds as a structured clone; accept a JSON string too. */
+    readDetail(event) {
+      let detail = event && event.detail;
+      if (typeof detail === 'string') {
+        try {
+          detail = JSON.parse(detail);
+        } catch (_) {
+          return null;
+        }
+      }
+      return detail && typeof detail === 'object' ? detail : null;
+    },
+
+    /* --- storage -------------------------------------------------------- */
+
+    prune(entries) {
+      const now = Date.now();
+      const fresh = {};
+      for (const [key, entry] of Object.entries(entries || {})) {
+        if (entry && typeof entry.timestamp === 'number' && now - entry.timestamp < FOLLOW_SYNC_TTL_MS) {
+          fresh[key] = entry;
+        }
+      }
+      return fresh;
+    },
+
+    async load() {
+      try {
+        const data = await chrome.storage.local.get(FOLLOW_SYNC_KEY);
+        const stored = data[FOLLOW_SYNC_KEY] || {};
+        this.entries = this.prune(stored);
+        if (Object.keys(this.entries).length !== Object.keys(stored).length) {
+          await chrome.storage.local.set({ [FOLLOW_SYNC_KEY]: this.entries });
+        }
+      } catch (err) {
+        warn('Follow-Sync: could not read storage', err);
+        this.entries = {};
+      }
+    },
+
+    /**
+     * Read-modify-write, serialised per tab and re-read from storage each time
+     * so that concurrent writes from other tabs are not lost.
+     */
+    update(mutator) {
+      const next = this.writeQueue.then(async () => {
+        try {
+          const data = await chrome.storage.local.get(FOLLOW_SYNC_KEY);
+          const entries = this.prune(data[FOLLOW_SYNC_KEY] || {});
+          mutator(entries);
+          await chrome.storage.local.set({ [FOLLOW_SYNC_KEY]: entries });
+          this.entries = entries;
+        } catch (err) {
+          // "Extension context invalidated" after an update, quota, etc.
+          warn('Follow-Sync: storage write failed', err);
+        }
+        this.scheduleScan();
+      });
+      this.writeQueue = next.catch(() => {});
+      return next;
+    },
+
+    /** Keys of entries that describe the same account. */
+    matchingKeys(entries, { username, userId }) {
+      const name = username ? String(username).toLowerCase() : null;
+      return Object.keys(entries).filter((key) => {
+        const e = entries[key];
+        return (userId && e.userId === String(userId)) || (name && e.username && e.username.toLowerCase() === name);
+      });
+    },
+
+    /* --- events from interceptor.js -------------------------------------- */
+
+    onConfirmed(detail) {
+      if (!detail) return;
+      const followStatus = Number(detail.followStatus);
+      const userId = detail.userId ? String(detail.userId) : null;
+      let username = detail.username ? String(detail.username).replace(/^@/, '') : null;
+      if (!userId && !username) return;
+      if (!username && userId) {
+        for (const [name, id] of this.usernameToId) if (id === userId) username = name;
+      }
+
+      if (followStatus === 0) {
+        log(`Follow-Sync: unfollow confirmed for ${username || userId} — removing from cache.`);
+        this.update((entries) => {
+          for (const key of this.matchingKeys(entries, { username, userId })) delete entries[key];
+        });
+        return;
+      }
+      if (!FOLLOWING_STATES.has(followStatus) && followStatus !== REQUESTED_STATE) return;
+
+      log(`Follow-Sync: server confirmed follow_status=${followStatus} for ${username || userId}.`);
+      this.update((entries) => {
+        for (const key of this.matchingKeys(entries, { username, userId })) delete entries[key];
+        entries[userId || `@${username.toLowerCase()}`] = {
+          username,
+          userId,
+          secUid: detail.secUid || null,
+          followStatus,
+          timestamp: Number(detail.timestamp) || Date.now(),
+        };
+      });
+    },
+
+    onIdentity(detail) {
+      if (!detail || !detail.username || !detail.userId) return;
+      const name = String(detail.username).toLowerCase();
+      const userId = String(detail.userId);
+      this.usernameToId.set(name, userId);
+
+      // Back-fill the username of an entry stored while it was unknown.
+      const entry = this.entries[userId];
+      if (entry && !entry.username) {
+        this.update((entries) => {
+          if (entries[userId]) entries[userId].username = String(detail.username);
+        });
+      } else if (this.currentUsername() === name) {
+        this.scheduleScan();
+      }
+    },
+
+    /* --- profile page DOM ------------------------------------------------ */
+
+    /** `@name` of a profile page (not /@name/video/…), lower-cased, or null. */
+    currentUsername() {
+      const m = /^\/@([^/?#]+)\/?$/.exec(window.location.pathname);
+      if (!m) return null;
+      try {
+        return decodeURIComponent(m[1]).toLowerCase();
+      } catch (_) {
+        return m[1].toLowerCase();
+      }
+    },
+
+    entryForProfile(username) {
+      const userId = this.usernameToId.get(username) || null;
+      const keys = this.matchingKeys(this.entries, { username, userId });
+      return keys.length ? this.entries[keys[0]] : null;
+    },
+
+    labelOf(el) {
+      return normalizeText(el.textContent || el.getAttribute('aria-label'));
+    },
+
+    /** The profile header's primary follow button, or null. */
+    findProfileButton() {
+      const isCandidate = (el) => el && !el.closest('[data-e2e="follow-info-popup"]');
+      const title = document.querySelector('[data-e2e="user-title"], [data-e2e="user-subtitle"]');
+
+      let container = title;
+      for (let depth = 0; container && depth < 8; depth += 1) {
+        const tagged = container.querySelector('[data-e2e="follow-button"]');
+        if (isCandidate(tagged)) return tagged.closest('button') || tagged.querySelector('button') || tagged;
+        for (const btn of container.querySelectorAll('button')) {
+          if (isCandidate(btn) && (btn.hasAttribute(PATCH_ATTR) || btn.closest(`[${PATCH_ATTR}]`) || FOLLOW_LABEL_RE.test(this.labelOf(btn)))) return btn;
+        }
+        container = container.parentElement;
+      }
+
+      const fallback = [...document.querySelectorAll('[data-e2e="follow-button"]')].find(isCandidate);
+      return fallback ? fallback.closest('button') || fallback : null;
+    },
+
+    unpatch() {
+      if (this.patchedButton && this.forwardClick) {
+        this.patchedButton.removeEventListener('click', this.forwardClick);
+      }
+      this.forwardClick = null;
+      if (this.patchedButton) {
+        this.patchedButton.removeAttribute(PATCH_ATTR);
+        this.patchedButton.removeAttribute(LABEL_ATTR);
+        if (this.patchedButton.dataset.ttfsTitle !== undefined) {
+          const original = this.patchedButton.dataset.ttfsTitle;
+          if (original) this.patchedButton.setAttribute('title', original);
+          else this.patchedButton.removeAttribute('title');
+          delete this.patchedButton.dataset.ttfsTitle;
+        }
+      }
+      this.patchedButton = null;
+    },
+
+    /**
+     * TikTok often paints the pink background on a wrapper around the real
+     * <button>. Walk up through ancestors that are just a tight box around it
+     * (single child, same size) and patch the outermost one, so our colours
+     * replace TikTok's instead of sitting on top of them.
+     */
+    patchTarget(button) {
+      let target = button;
+      const box = button.getBoundingClientRect();
+      for (let depth = 0; depth < 4; depth += 1) {
+        const parent = target.parentElement;
+        if (!parent || parent === document.body || parent.children.length !== 1) break;
+        const r = parent.getBoundingClientRect();
+        const sameBox = Math.abs(r.width - box.width) <= 6 && Math.abs(r.height - box.height) <= 6;
+        if (!sameBox) break;
+        target = parent;
+      }
+      return target;
+    },
+
+    patch(realButton, entry) {
+      const button = this.patchTarget(realButton);
+      const requested = entry.followStatus === REQUESTED_STATE;
+      const label = requested ? 'Requested ✓' : 'Following ✓ (Confirmed)';
+      if (this.patchedButton !== button) {
+        this.unpatch();
+        button.dataset.ttfsTitle = button.getAttribute('title') || '';
+        this.patchedButton = button;
+        if (button !== realButton) {
+          // The real <button> is hidden inside the wrapper: pass clicks on to it.
+          this.forwardClick = (e) => {
+            if (e.target === button && realButton.isConnected) realButton.click();
+          };
+          button.addEventListener('click', this.forwardClick);
+        }
+        log(`Follow-Sync: page shows a stale "Follow" for @${entry.username || entry.userId}; ` +
+          `server confirmed follow_status=${entry.followStatus}. Re-labelled.`);
+      }
+      button.setAttribute(PATCH_ATTR, requested ? 'requested' : 'following');
+      button.setAttribute(LABEL_ATTR, label);
+      button.setAttribute('title',
+        'TikTok saved this follow on the server, but the page is showing an old cached copy. ' +
+        'Use "Hard Refresh" in the extension popup to reload without cache.');
+    },
+
+    scheduleScan() {
+      if (this.scanTimer) return;
+      this.scanTimer = setTimeout(() => {
+        this.scanTimer = null;
+        try {
+          this.scan();
+        } catch (err) {
+          warn('Follow-Sync scan failed', err);
+        }
+      }, 300);
+    },
+
+    scan() {
+      const username = this.currentUsername();
+      const entry = username ? this.entryForProfile(username) : null;
+      if (!entry) {
+        this.unpatch();
+        this.lastState = username ? { username, confirmed: false, patched: false } : null;
+        return;
+      }
+
+      const button = this.findProfileButton();
+      // textContent is unaffected by our CSS, so this still reads TikTok's real label.
+      const stale = button && FOLLOW_LABEL_RE.test(this.labelOf(button));
+      if (stale) this.patch(button, entry);
+      else this.unpatch();
+
+      this.lastState = { username, confirmed: true, followStatus: entry.followStatus, patched: Boolean(stale) };
+    },
+
+    status() {
+      return { ok: true, ...(this.lastState || { username: null }) };
+    },
+
+    injectStyle() {
+      if (document.getElementById('ttfs-style')) return;
+      const style = document.createElement('style');
+      style.id = 'ttfs-style';
+      // `html body` raises specificity above TikTok's single-class CSS-in-JS rules.
+      const sel = `html body [${PATCH_ATTR}]`;
+      style.textContent = `
+        ${sel} {
+          font-size: 0 !important;
+          color: transparent !important;
+          background: #123d2a !important;
+          background-image: none !important;
+          border: 1px solid #2fbf71 !important;
+          box-shadow: none !important;
+          min-width: max-content !important;
+          display: inline-flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+        }
+        ${sel} *, ${sel}::before { display: none !important; }
+        ${sel}::after {
+          content: attr(${LABEL_ATTR});
+          display: inline-block !important;
+          padding: 0 12px;
+          font: 600 15px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          color: #3ddc84 !important;
+          background: transparent !important;
+          white-space: nowrap;
+        }
+        ${sel}[${PATCH_ATTR}="requested"] {
+          background: #3d2e10 !important;
+          border-color: #e0a526 !important;
+        }
+        ${sel}[${PATCH_ATTR}="requested"]::after { color: #ffc24d !important; }`;
+      (document.head || document.documentElement).appendChild(style);
+    },
+  };
+
+  /* ======================================================================= */
   /* 7. Message bridge (popup -> content)                                    */
   /* ======================================================================= */
 
@@ -716,6 +1079,9 @@
       case 'TTAF_STOP_SCROLL':
         sendResponse(AutoScroller.stop('stopped by user'));
         return false;
+      case 'TTFS_GET_STATUS':
+        sendResponse(FollowSync.status());
+        return false;
       case 'GET_SCROLL_STATUS':
         sendResponse(AutoScroller.status());
         return false;
@@ -730,6 +1096,7 @@
           breakerOpen: retry.attempts >= CONFIG.maxAttempts && !retry.pendingReloadVerify,
           errorVisible: Boolean(ErrorDetector.findErrorElement()),
           scroll: AutoScroller.status(),
+          followSync: FollowSync.status(),
         });
         return false;
       }
@@ -751,7 +1118,10 @@
     NavigationWatch.init(() => {
       if (isScrolling) AutoScroller.stop('stopped (navigation)');
       AutoFixer.resetForNavigation();
+      FollowSync.scheduleScan();
     });
+
+    FollowSync.init().catch((err) => warn('Follow-Sync init failed', err));
 
     Settings.onChange((enabled) => {
       if (enabled) AutoFixer.start();
