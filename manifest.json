@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "TikTok Auto-Fix & Following Helper",
   "short_name": "TT Auto-Fix",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Recovers from TikTok's \"Something went wrong\" error, auto-scrolls Following/Followers lists, and fixes stale cached \"Follow\" buttons after a confirmed follow.",
   "minimum_chrome_version": "111",
   "permissions": [

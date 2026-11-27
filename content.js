@@ -916,7 +916,7 @@
         const tagged = container.querySelector('[data-e2e="follow-button"]');
         if (isCandidate(tagged)) return tagged.closest('button') || tagged.querySelector('button') || tagged;
         for (const btn of container.querySelectorAll('button')) {
-          if (isCandidate(btn) && (btn.hasAttribute(PATCH_ATTR) || FOLLOW_LABEL_RE.test(this.labelOf(btn)))) return btn;
+          if (isCandidate(btn) && (btn.hasAttribute(PATCH_ATTR) || btn.closest(`[${PATCH_ATTR}]`) || FOLLOW_LABEL_RE.test(this.labelOf(btn)))) return btn;
         }
         container = container.parentElement;
       }
@@ -926,6 +926,10 @@
     },
 
     unpatch() {
+      if (this.patchedButton && this.forwardClick) {
+        this.patchedButton.removeEventListener('click', this.forwardClick);
+      }
+      this.forwardClick = null;
       if (this.patchedButton) {
         this.patchedButton.removeAttribute(PATCH_ATTR);
         this.patchedButton.removeAttribute(LABEL_ATTR);
@@ -939,13 +943,41 @@
       this.patchedButton = null;
     },
 
-    patch(button, entry) {
+    /**
+     * TikTok often paints the pink background on a wrapper around the real
+     * <button>. Walk up through ancestors that are just a tight box around it
+     * (single child, same size) and patch the outermost one, so our colours
+     * replace TikTok's instead of sitting on top of them.
+     */
+    patchTarget(button) {
+      let target = button;
+      const box = button.getBoundingClientRect();
+      for (let depth = 0; depth < 4; depth += 1) {
+        const parent = target.parentElement;
+        if (!parent || parent === document.body || parent.children.length !== 1) break;
+        const r = parent.getBoundingClientRect();
+        const sameBox = Math.abs(r.width - box.width) <= 6 && Math.abs(r.height - box.height) <= 6;
+        if (!sameBox) break;
+        target = parent;
+      }
+      return target;
+    },
+
+    patch(realButton, entry) {
+      const button = this.patchTarget(realButton);
       const requested = entry.followStatus === REQUESTED_STATE;
       const label = requested ? 'Requested ✓' : 'Following ✓ (Confirmed)';
       if (this.patchedButton !== button) {
         this.unpatch();
         button.dataset.ttfsTitle = button.getAttribute('title') || '';
         this.patchedButton = button;
+        if (button !== realButton) {
+          // The real <button> is hidden inside the wrapper: pass clicks on to it.
+          this.forwardClick = (e) => {
+            if (e.target === button && realButton.isConnected) realButton.click();
+          };
+          button.addEventListener('click', this.forwardClick);
+        }
         log(`Follow-Sync: page shows a stale "Follow" for @${entry.username || entry.userId}; ` +
           `server confirmed follow_status=${entry.followStatus}. Re-labelled.`);
       }
@@ -994,29 +1026,36 @@
       if (document.getElementById('ttfs-style')) return;
       const style = document.createElement('style');
       style.id = 'ttfs-style';
+      // `html body` raises specificity above TikTok's single-class CSS-in-JS rules.
+      const sel = `html body [${PATCH_ATTR}]`;
       style.textContent = `
-        [${PATCH_ATTR}] {
+        ${sel} {
           font-size: 0 !important;
           color: transparent !important;
-          background: rgba(37, 179, 102, 0.12) !important;
-          border: 1px solid rgba(37, 179, 102, 0.65) !important;
+          background: #123d2a !important;
+          background-image: none !important;
+          border: 1px solid #2fbf71 !important;
           box-shadow: none !important;
           min-width: max-content !important;
+          display: inline-flex !important;
+          align-items: center !important;
+          justify-content: center !important;
         }
-        [${PATCH_ATTR}] > * { display: none !important; }
-        [${PATCH_ATTR}]::after {
+        ${sel} *, ${sel}::before { display: none !important; }
+        ${sel}::after {
           content: attr(${LABEL_ATTR});
-          display: inline-block;
-          padding: 0 10px;
+          display: inline-block !important;
+          padding: 0 12px;
           font: 600 15px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-          color: #1fa463;
+          color: #3ddc84 !important;
+          background: transparent !important;
           white-space: nowrap;
         }
-        [${PATCH_ATTR}="requested"]::after { color: #c98a12; }
-        [${PATCH_ATTR}="requested"] {
-          background: rgba(201, 138, 18, 0.12) !important;
-          border-color: rgba(201, 138, 18, 0.65) !important;
-        }`;
+        ${sel}[${PATCH_ATTR}="requested"] {
+          background: #3d2e10 !important;
+          border-color: #e0a526 !important;
+        }
+        ${sel}[${PATCH_ATTR}="requested"]::after { color: #ffc24d !important; }`;
       (document.head || document.documentElement).appendChild(style);
     },
   };
