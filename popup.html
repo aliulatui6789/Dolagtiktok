@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TikTok Auto-Fix</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <img src="icons/icon48.png" alt="" width="28" height="28">
+    <div>
+      <h1>TikTok Auto-Fix</h1>
+      <p class="subtitle">&amp; Following Helper</p>
+    </div>
+  </header>
+
+  <section class="card">
+    <label class="row toggle-row" for="autoFixToggle">
+      <span>
+        <span class="row-title">Auto-Fix errors</span>
+        <span class="row-hint">"Something went wrong" / "Đã xảy ra sự cố"</span>
+      </span>
+      <span class="switch">
+        <input type="checkbox" id="autoFixToggle" role="switch" checked>
+        <span class="slider" aria-hidden="true"></span>
+      </span>
+    </label>
+
+    <div class="row stats">
+      <div class="stat">
+        <span class="stat-value" id="fixedCount">0</span>
+        <span class="stat-label">errors fixed this session</span>
+      </div>
+      <button type="button" class="link-btn" id="resetCounter" title="Reset counter">Reset</button>
+    </div>
+
+    <p class="page-status" id="pageStatus">Checking current tab…</p>
+  </section>
+
+  <section class="card">
+    <div class="row-title">Following / Followers list</div>
+    <p class="row-hint">Open the list on TikTok, then start auto-scroll. Stops automatically at the end of the list.</p>
+    <div class="actions">
+      <button type="button" class="btn primary" id="startScroll">Start Auto-Scroll List</button>
+      <button type="button" class="btn secondary" id="stopScroll">Stop Auto-Scroll</button>
+    </div>
+    <p class="scroll-status" id="scrollStatus">Idle</p>
+  </section>
+
+  <footer class="footer" id="footer">v<span id="version"></span></footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

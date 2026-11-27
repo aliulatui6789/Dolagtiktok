@@ -1,0 +1,89 @@
+/* popup.css — dark, minimal UI. Accent colours: cyan #25F4EE, pink #FE2C55. */
+:root {
+  --bg: #0f0f14;
+  --card: #18181f;
+  --border: rgba(255, 255, 255, 0.07);
+  --text: #f2f2f5;
+  --muted: #9a9aa6;
+  --cyan: #25f4ee;
+  --pink: #fe2c55;
+  --radius: 12px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 14px;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.header img { border-radius: 7px; }
+h1 { margin: 0; font-size: 15px; font-weight: 700; }
+.subtitle { margin: 0; color: var(--muted); font-size: 12px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.toggle-row { cursor: pointer; }
+.row-title { display: block; font-weight: 600; }
+.row-hint { display: block; color: var(--muted); font-size: 11.5px; margin: 2px 0 0; }
+
+/* --- Toggle switch ------------------------------------------------------ */
+.switch { position: relative; flex: 0 0 auto; width: 40px; height: 22px; }
+.switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.slider {
+  position: absolute; inset: 0; border-radius: 999px;
+  background: #3a3a45; transition: background 0.2s;
+}
+.slider::before {
+  content: ""; position: absolute; top: 3px; left: 3px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; transition: transform 0.2s;
+}
+.switch input:checked + .slider { background: var(--pink); }
+.switch input:checked + .slider::before { transform: translateX(18px); }
+.switch input:focus-visible + .slider { outline: 2px solid var(--cyan); outline-offset: 2px; }
+
+/* --- Counter ------------------------------------------------------------ */
+.stats { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.stat { display: flex; align-items: baseline; gap: 8px; }
+.stat-value { font-size: 26px; font-weight: 700; color: var(--cyan); font-variant-numeric: tabular-nums; }
+.stat-label { color: var(--muted); }
+
+.link-btn {
+  background: none; border: 0; padding: 4px 6px; border-radius: 6px;
+  color: var(--muted); font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.link-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+
+.page-status, .scroll-status {
+  margin: 10px 0 0; font-size: 11.5px; color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.page-status.warn, .scroll-status.warn { color: #ffb86b; }
+.scroll-status.active { color: var(--cyan); }
+
+/* --- Buttons ------------------------------------------------------------ */
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.btn {
+  border: 0; border-radius: 9px; padding: 9px 8px; cursor: pointer;
+  font: inherit; font-weight: 600; color: #fff; transition: filter 0.15s, opacity 0.15s;
+}
+.btn:hover:not(:disabled) { filter: brightness(1.12); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.primary { background: var(--pink); }
+.btn.secondary { background: #2c2c36; }
+
+.footer { text-align: center; color: #5c5c68; font-size: 11px; }
